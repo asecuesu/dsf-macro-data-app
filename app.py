@@ -43,6 +43,7 @@ from modules.data_fetcher import (
 )
 from modules.dsf_calculator import (
     compute_ci, compute_external_indicators, compute_public_indicator,
+    compute_pv_from_face_value, compute_total_pv_series, grant_element,
     check_thresholds, check_public_threshold, run_stress_tests,
     run_full_dsa,
 )
@@ -139,6 +140,16 @@ def _init_state():
         "cpia_override":  None,
         "in_distress":    False,
         "contingent_pct": 5.0,
+        # PV decomposition assumptions
+        "dom_coupon_pct":   8.0,
+        "dom_maturity_yr":  5.0,
+        "dom_discount_pct": 5.0,
+        "dom_amortization": "level",
+        "override_ext_pv":  False,
+        "ext_coupon_pct":   2.0,
+        "ext_maturity_yr":  15.0,
+        "ext_discount_pct": 5.0,
+        "ext_amortization": "level",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -218,6 +229,117 @@ with st.sidebar:
     st.session_state["in_distress"] = in_distress
 
     st.divider()
+    st.markdown("#### 📐 PV Calculation Assumptions")
+    st.caption("Used in the Total DSA tab to decompose PV of debt into external + domestic components.")
+
+    with st.expander("🌐 External Debt PV", expanded=False):
+        override_ext_pv = st.checkbox(
+            "Override WB pre-computed PV",
+            value=st.session_state["override_ext_pv"],
+            help=(
+                "By default the app uses the World Bank's pre-computed "
+                "DT.DOD.PVLX.CD series (which embeds the standard 5% "
+                "discount rate). Check this box to instead recompute PV "
+                "from the face value using the assumptions below."
+            ),
+        )
+        st.session_state["override_ext_pv"] = override_ext_pv
+
+        ext_discount_pct = st.number_input(
+            "Discount Rate — Ext. (%)",
+            min_value=1.0, max_value=20.0,
+            value=float(st.session_state["ext_discount_pct"]),
+            step=0.5, format="%.1f",
+            help="IMF/WB LIC DSF standard: 5%. Change to stress-test.",
+            disabled=not override_ext_pv,
+        )
+        st.session_state["ext_discount_pct"] = ext_discount_pct
+
+        ext_coupon_pct = st.number_input(
+            "Avg Coupon — Ext. (%)",
+            min_value=0.0, max_value=20.0,
+            value=float(st.session_state["ext_coupon_pct"]),
+            step=0.25, format="%.2f",
+            help="Average interest rate on the external debt portfolio.",
+            disabled=not override_ext_pv,
+        )
+        st.session_state["ext_coupon_pct"] = ext_coupon_pct
+
+        ext_maturity_yr = st.number_input(
+            "Avg Remaining Maturity — Ext. (yrs)",
+            min_value=1.0, max_value=40.0,
+            value=float(st.session_state["ext_maturity_yr"]),
+            step=1.0, format="%.0f",
+            help="Average remaining maturity of the external debt portfolio.",
+            disabled=not override_ext_pv,
+        )
+        st.session_state["ext_maturity_yr"] = ext_maturity_yr
+
+        ext_amortization = st.selectbox(
+            "Amortization — Ext.",
+            options=["level", "bullet"],
+            index=0 if st.session_state["ext_amortization"] == "level" else 1,
+            format_func=lambda x: "Level (equal principal)" if x == "level" else "Bullet (bond-style)",
+            disabled=not override_ext_pv,
+        )
+        st.session_state["ext_amortization"] = ext_amortization
+
+    with st.expander("🏠 Domestic Debt PV", expanded=True):
+        dom_coupon_pct = st.number_input(
+            "Avg Coupon — Dom. (%)",
+            min_value=0.0, max_value=40.0,
+            value=float(st.session_state["dom_coupon_pct"]),
+            step=0.5, format="%.1f",
+            help=(
+                "Average interest rate on domestic government debt. "
+                "Typically higher than external (especially for short T-bill "
+                "heavy portfolios). Common range: 5–15%."
+            ),
+        )
+        st.session_state["dom_coupon_pct"] = dom_coupon_pct
+
+        dom_maturity_yr = st.number_input(
+            "Avg Maturity — Dom. (yrs)",
+            min_value=1.0, max_value=30.0,
+            value=float(st.session_state["dom_maturity_yr"]),
+            step=0.5, format="%.1f",
+            help=(
+                "Average remaining maturity of domestic debt. "
+                "LICs often have short domestic maturities (1–5 yrs). "
+                "Use 1–3 for T-bill heavy portfolios."
+            ),
+        )
+        st.session_state["dom_maturity_yr"] = dom_maturity_yr
+
+        dom_discount_pct = st.number_input(
+            "Discount Rate — Dom. (%)",
+            min_value=1.0, max_value=20.0,
+            value=float(st.session_state["dom_discount_pct"]),
+            step=0.5, format="%.1f",
+            help=(
+                "Discount rate for domestic debt. The IMF uses 5% for "
+                "external debt uniformly; for domestic debt some analysts "
+                "use the country's domestic risk-free rate."
+            ),
+        )
+        st.session_state["dom_discount_pct"] = dom_discount_pct
+
+        dom_amortization = st.selectbox(
+            "Amortization — Dom.",
+            options=["level", "bullet"],
+            index=0 if st.session_state["dom_amortization"] == "level" else 1,
+            format_func=lambda x: "Level (equal principal)" if x == "level" else "Bullet (bond-style)",
+            help="Level = equal annual repayments (loans). Bullet = all principal at end (bonds).",
+        )
+        st.session_state["dom_amortization"] = dom_amortization
+
+        st.caption(
+            "💡 **Data source for domestic debt face value**: "
+            "IMF WEO `GGXWDG_NGDP` (Total General Govt Gross Debt % GDP) "
+            "minus World Bank `DT.DOD.DPPG.CD` (External PPG, converted to % GDP)."
+        )
+
+    st.divider()
 
     # Fetch button
     fetch_btn = st.button(
@@ -276,7 +398,14 @@ Data sources: IMF WEO & World Bank IDS public APIs.
 # Data Fetching & DSA Computation
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_dsa_pipeline(country: str, base_yr: int, cpia: float, in_dist: bool, cont_pct: float):
+def run_dsa_pipeline(
+    country: str, base_yr: int, cpia: float, in_dist: bool, cont_pct: float,
+    dom_coupon_pct: float = 8.0, dom_maturity_yr: float = 5.0,
+    dom_discount_pct: float = 5.0, dom_amortization: str = "level",
+    override_ext_pv: bool = False, ext_coupon_pct: float = 2.0,
+    ext_maturity_yr: float = 15.0, ext_discount_pct: float = 5.0,
+    ext_amortization: str = "level",
+):
     """Full live-data fetch + DSA computation pipeline."""
     meta = LIC_COUNTRIES[country]
     iso3 = meta["iso3"]
@@ -334,6 +463,15 @@ def run_dsa_pipeline(country: str, base_yr: int, cpia: float, in_dist: bool, con
         world_growth=world_growth,
         in_distress=in_dist,
         contingent_pct=cont_pct,
+        dom_coupon_pct=dom_coupon_pct,
+        dom_maturity_yr=dom_maturity_yr,
+        dom_discount_pct=dom_discount_pct,
+        dom_amortization=dom_amortization,
+        override_ext_pv=override_ext_pv,
+        ext_coupon_pct=ext_coupon_pct,
+        ext_maturity_yr=ext_maturity_yr,
+        ext_discount_pct=ext_discount_pct,
+        ext_amortization=ext_amortization,
     )
 
     progress.progress(100, text="✅ Done!")
@@ -350,6 +488,15 @@ if fetch_btn:
                 selected_country, base_year,
                 st.session_state["cpia_override"] or default_cpia,
                 in_distress, contingent_pct,
+                dom_coupon_pct   = st.session_state["dom_coupon_pct"],
+                dom_maturity_yr  = st.session_state["dom_maturity_yr"],
+                dom_discount_pct = st.session_state["dom_discount_pct"],
+                dom_amortization = st.session_state["dom_amortization"],
+                override_ext_pv  = st.session_state["override_ext_pv"],
+                ext_coupon_pct   = st.session_state["ext_coupon_pct"],
+                ext_maturity_yr  = st.session_state["ext_maturity_yr"],
+                ext_discount_pct = st.session_state["ext_discount_pct"],
+                ext_amortization = st.session_state["ext_amortization"],
             )
             st.session_state.update({
                 "data_loaded":  True,
@@ -392,6 +539,15 @@ elif rerun_btn and st.session_state["data_loaded"]:
                 world_growth=world_growth,
                 in_distress=in_distress,
                 contingent_pct=contingent_pct,
+                dom_coupon_pct   = st.session_state["dom_coupon_pct"],
+                dom_maturity_yr  = st.session_state["dom_maturity_yr"],
+                dom_discount_pct = st.session_state["dom_discount_pct"],
+                dom_amortization = st.session_state["dom_amortization"],
+                override_ext_pv  = st.session_state["override_ext_pv"],
+                ext_coupon_pct   = st.session_state["ext_coupon_pct"],
+                ext_maturity_yr  = st.session_state["ext_maturity_yr"],
+                ext_discount_pct = st.session_state["ext_discount_pct"],
+                ext_amortization = st.session_state["ext_amortization"],
             )
             st.session_state["ci_result"]   = ci_result
             st.session_state["dsa_results"] = dsa_results
@@ -408,7 +564,7 @@ tab_home, tab_macro, tab_ci, tab_ext, tab_pub, tab_rating, tab_sources, tab_expo
     "🏠 Home",
     "📊 Macro",
     "🔢 CI",
-    "📈 Ext. DSA",
+    "🏦 Total DSA",
     "🏛️ Pub. DSA",
     "⚠️ Rating",
     "🔗 Sources",
@@ -747,30 +903,80 @@ with tab_ci:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TAB 4 — External DSA
+# TAB 4 — Total DSA  (External PPG + Domestic Public Debt)
 # ════════════════════════════════════════════════════════════════════════════
 with tab_ext:
     if not st.session_state["data_loaded"]:
-        st.info("Run the DSA first to see External DSA results.")
+        st.info("Run the DSA first to see Total DSA results.")
     else:
-        dsa_r  = st.session_state["dsa_results"]
-        ci     = dsa_r["ci"]
-        thresh = dsa_r["thresholds"]
-        ext_df = dsa_r["ext_indicators"]
-        base_yr= st.session_state["base_year"]
-        country= st.session_state["selected_country"]
+        dsa_r   = st.session_state["dsa_results"]
+        ci      = dsa_r["ci"]
+        thresh  = dsa_r["thresholds"]
+        ext_df  = dsa_r["ext_indicators"]
+        pv_dec  = dsa_r.get("pv_decomp", pd.DataFrame())
+        pv_ass  = dsa_r.get("pv_assumptions", {})
+        base_yr = st.session_state["base_year"]
+        country = st.session_state["selected_country"]
 
-        st.markdown(f"### External PPG Debt Sustainability Analysis — {country}")
+        st.markdown(f"### Total Debt Sustainability Analysis — {country}")
         st.caption(
             f"Classification: **{ci.classification}** | "
-            f"Thresholds — PV/GDP: {thresh['pv_gdp']}% | "
+            f"LIC DSF Thresholds — PV/GDP: {thresh['pv_gdp']}% | "
             f"PV/Exp: {thresh['pv_exports']}% | "
             f"DS/Exp: {thresh['ds_exports']}% | "
             f"DS/Rev: {thresh['ds_revenues']}%"
         )
 
+        st.info(
+            "**Methodology**: Total PV of Debt = "
+            "**Component 1** (External PPG, pre-computed by World Bank at 5%) + "
+            "**Component 2** (Domestic public debt, computed here using your assumptions). "
+            "The four LIC DSF binding thresholds (below) apply to **external PPG only**. "
+            "The total PV / GDP metric is informational, consistent with IMF Article IV practice.",
+            icon="ℹ️",
+        )
+
+        # ─────────────────────────────────────────────────────────────────
+        # COMPONENT 1 — External PPG Debt PV
+        # ─────────────────────────────────────────────────────────────────
+        st.markdown('<div class="section-header">Component 1 — External PPG Debt (Present Value)</div>', unsafe_allow_html=True)
+
+        _ext_src = "WB pre-computed `DT.DOD.PVLX.CD` (embeds 5% discount rate — IMF/WB standard)"
+        if pv_ass.get("override_ext_pv"):
+            _ext_src = (
+                f"Recomputed from face value (`DT.DOD.DPPG.CD`) using "
+                f"coupon={pv_ass.get('ext_coupon_pct', 2):.2f}%, "
+                f"maturity={float(pv_ass.get('ext_maturity_yr', 15)):.0f} yrs, "
+                f"discount rate={pv_ass.get('ext_discount_pct', 5):.1f}%"
+            )
+        st.caption(f"📡 Source: {_ext_src}")
+
+        with st.expander("📖 How is external PV computed?", expanded=False):
+            st.markdown("""
+**Standard IMF/World Bank approach (LIC DSF 2017):**
+
+1. For each individual loan in the country's external debt portfolio, the **future stream
+   of principal repayments + interest payments** is discounted at **5% per annum**.
+2. The present values are summed across all loans → `PV of External PPG Debt`.
+3. The **grant element** of a loan = `(Face Value − PV) / Face Value × 100`.
+   A loan with a grant element ≥ 35% at 5% is classified as *concessional*.
+4. **Why 5%?**  Prior to 2013, the IMF/WB used country-specific CIRRs (commercial
+   interest reference rates), which varied by currency and fluctuated with markets.
+   The 2013 reform standardised to a **fixed 5% rate** for all countries to improve
+   cross-country comparability and transparency.
+5. **What this app does**: It reads the World Bank's pre-computed `DT.DOD.PVLX.CD`
+   series, which already embeds the 5% discount rate.  If you enable
+   *"Override WB pre-computed PV"* in the sidebar, it instead recomputes from the
+   face value of `DT.DOD.DPPG.CD` using your chosen coupon, maturity, and
+   discount rate assumptions.
+
+> ⚠️ **Limitation**: The WB series covers **external PPG debt only** (Public and
+> Publicly Guaranteed).  It does NOT include private non-guaranteed external debt or
+> any domestic debt.
+            """)
+
         # Baseline threshold status
-        st.markdown('<div class="section-header">Baseline Threshold Status</div>', unsafe_allow_html=True)
+        st.markdown("#### LIC DSF Threshold Status (External PPG)")
         threshold_cols = st.columns(4)
         for i, t in enumerate(dsa_r["baseline_thresholds"]):
             with threshold_cols[i % 4]:
@@ -790,27 +996,24 @@ with tab_ext:
         for st_test in dsa_r["stress_tests"]:
             if st_test.scenario == "historical":
                 continue
-            # Map stress test results to a DataFrame for charting
             stress_row = {}
             for t in st_test.indicators:
                 ind_map = {
-                    "PV Debt / GDP (%)":       "pv_debt_gdp",
-                    "PV Debt / Exports (%)":   "pv_debt_exports",
-                    "Debt Service / Exports (%)": "ds_exports",
-                    "Debt Service / Revenue (%)": "ds_revenues",
+                    "PV Debt / GDP (%)":          "pv_debt_gdp",
+                    "PV Debt / Exports (%)":       "pv_debt_exports",
+                    "Debt Service / Exports (%)":  "ds_exports",
+                    "Debt Service / Revenue (%)":  "ds_revenues",
                 }
                 col_name = ind_map.get(t.indicator)
                 if col_name:
                     stress_row[col_name] = t.value
             if stress_row and not ext_df.empty:
-                # Create a synthetic DataFrame for visualization
                 stress_df = ext_df.copy()
                 for col_n, val in stress_row.items():
                     if col_n in stress_df.columns:
-                        stress_df[col_n] = val   # simplified: worst value for all years
+                        stress_df[col_n] = val
                 stress_bands[st_test.name] = stress_df
 
-        # Main indicator chart
         fig_ext = plot_external_indicators(
             ext_baseline=ext_df,
             thresholds=thresh,
@@ -819,8 +1022,7 @@ with tab_ext:
         )
         st.plotly_chart(fig_ext, use_container_width=True)
 
-        # Threshold summary bar chart
-        st.markdown('<div class="section-header">Threshold Breach Summary (all scenarios)</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-header">Threshold Breach Summary — all scenarios (External PPG)</div>', unsafe_allow_html=True)
         fig_summ = plot_threshold_summary(
             dsa_r["baseline_thresholds"],
             ci.classification,
@@ -828,7 +1030,6 @@ with tab_ext:
         )
         st.plotly_chart(fig_summ, use_container_width=True)
 
-        # Raw indicator table
         with st.expander("📋 External Indicator Values by Year", expanded=False):
             if not ext_df.empty:
                 display_df = ext_df.copy()
@@ -839,28 +1040,215 @@ with tab_ext:
                     "DS/Revenue (%)" if c == "ds_revenues" else c
                     for c in display_df.columns
                 ]
-                # Highlight breaches
-                thresh_cols = {
-                    "PV Debt/GDP (%)":      thresh["pv_gdp"],
-                    "PV Debt/Exports (%)":  thresh["pv_exports"],
-                    "DS/Exports (%)":       thresh["ds_exports"],
-                    "DS/Revenue (%)":       thresh["ds_revenues"],
+                thresh_col_map = {
+                    "PV Debt/GDP (%)":     thresh["pv_gdp"],
+                    "PV Debt/Exports (%)": thresh["pv_exports"],
+                    "DS/Exports (%)":      thresh["ds_exports"],
+                    "DS/Revenue (%)":      thresh["ds_revenues"],
                 }
-
-                # Add a breach indicator row instead of cell coloring (no Styler needed)
                 breach_row = {}
                 for col_n in display_df.columns:
-                    lim = thresh_cols.get(col_n, 9999)
-                    worst = display_df[col_n].dropna().max() if col_n in display_df.columns and not display_df[col_n].dropna().empty else 0
-                    breach_row[col_n] = f"⚠️ {worst:.1f}% (>{lim}%)" if worst > lim else f"✓ {worst:.1f}%"
+                    lim  = thresh_col_map.get(col_n, 9999)
+                    wst  = display_df[col_n].dropna().max() if not display_df[col_n].dropna().empty else 0
+                    breach_row[col_n] = f"⚠️ {wst:.1f}% (>{lim}%)" if wst > lim else f"✓ {wst:.1f}%"
                 breach_df = pd.DataFrame([breach_row], index=["Worst year"])
-
-                st.dataframe(
-                    display_df.round(1).fillna("—"),
-                    use_container_width=True, height=320,
-                )
+                st.dataframe(display_df.round(1).fillna("—"), use_container_width=True, height=320)
                 st.dataframe(breach_df, use_container_width=True)
                 st.caption("⚠️ = threshold breached | ✓ = within threshold")
+
+        # ─────────────────────────────────────────────────────────────────
+        # COMPONENT 2 — Domestic Debt PV
+        # ─────────────────────────────────────────────────────────────────
+        st.markdown('<div class="section-header">Component 2 — Domestic Public Debt (Present Value)</div>', unsafe_allow_html=True)
+
+        _dom_amort_label = "Level (equal principal)" if pv_ass.get("dom_amortization", "level") == "level" else "Bullet (bond-style)"
+        col_a1, col_a2, col_a3, col_a4 = st.columns(4)
+        with col_a1:
+            st.metric("Avg Coupon", f"{pv_ass.get('dom_coupon_pct', 8.0):.1f}%")
+        with col_a2:
+            st.metric("Avg Maturity", f"{float(pv_ass.get('dom_maturity_yr', 5.0)):.1f} yrs")
+        with col_a3:
+            st.metric("Discount Rate", f"{pv_ass.get('dom_discount_pct', 5.0):.1f}%")
+        with col_a4:
+            st.metric("Amortization", _dom_amort_label)
+
+        st.caption(
+            "⚙️ Adjust these in the sidebar → **Domestic Debt PV** expander. "
+            "Then click **♻️ Re-Run DSA** to recompute."
+        )
+
+        with st.expander("📖 How is domestic PV computed?", expanded=False):
+            st.markdown("""
+**Domestic debt data source — the unified repository problem:**
+
+Unlike external debt, there is **no single global database** for domestic government
+debt with loan-level detail.  The closest available proxies:
+
+| Source | What it provides | Gap |
+|--------|-----------------|-----|
+| IMF WEO `GGXWDG_NGDP` | Total General Govt Gross Debt % GDP | No creditor/maturity breakdown |
+| IMF Global Debt Database (GDD) | Public sector debt by debtor type | Manual download, not API |
+| World Bank | External debt only | No domestic coverage |
+| IMF Article IV | Detailed public debt tables | Country-specific, not scraped |
+| Country MoF / Central Bank | Full domestic debt registry | Not standardised / no API |
+
+**This app's transparent approximation:**
+
+**Step 1 — Face value:**
+```
+Domestic Debt (% GDP) = Total Public Debt (WEO GGXWDG_NGDP)
+                      − External PPG Debt (WB DT.DOD.DPPG.CD, converted to % GDP)
+```
+
+**Step 2 — PV formula** (level amortization, your assumptions):
+```
+For t = 1 … T (T = avg remaining maturity in years):
+  principal_t  = FaceValue / T             ← equal annual principal
+  interest_t   = remaining_balance × r_c   ← coupon on outstanding balance
+  cash_flow_t  = principal_t + interest_t
+  PV           = Σ  cash_flow_t / (1 + r_d)^t
+```
+where `r_c` = coupon rate, `r_d` = discount rate.
+
+**Bullet amortization** (bond-style):
+```
+PV = FaceValue × r_c × Σ 1/(1+r_d)^t   (coupons each year)
+   + FaceValue / (1+r_d)^T               (principal at maturity)
+```
+
+**Grant element** = `(Face − PV) / Face × 100`
+- Positive → concessional (coupon < discount rate)
+- Negative → non-concessional (coupon > discount rate, e.g. expensive domestic T-bills)
+
+> ⚠️ This is a **portfolio-level approximation**, not loan-by-loan.
+> Accuracy depends on coupon and maturity assumptions — stress-test them in the sidebar.
+            """)
+
+        if pv_dec.empty:
+            st.warning("Domestic debt breakdown not available — ensure data was fetched successfully.")
+        else:
+            pv_latest = pv_dec.dropna(subset=["dom_face_gdp"], how="all")
+            if not pv_latest.empty:
+                _yr  = pv_latest.index[0]   # first projection year
+                _row = pv_latest.loc[_yr]
+                col_d1, col_d2, col_d3, col_d4 = st.columns(4)
+                with col_d1:
+                    _df_v = _row.get("dom_face_gdp", np.nan)
+                    st.metric("Dom. Debt Face (% GDP)",
+                              f"{_df_v:.1f}%" if not pd.isna(_df_v) else "N/A",
+                              help=f"Year {_yr}: Total Pub Debt − External PPG")
+                with col_d2:
+                    _dp_v = _row.get("dom_pv_gdp", np.nan)
+                    st.metric("Dom. Debt PV (% GDP)",
+                              f"{_dp_v:.1f}%" if not pd.isna(_dp_v) else "N/A",
+                              help=f"Year {_yr}: Discounted at {pv_ass.get('dom_discount_pct', 5):.1f}%")
+                with col_d3:
+                    _ge_v = _row.get("dom_grant_element", np.nan)
+                    st.metric("Grant Element",
+                              f"{_ge_v:.1f}%" if not pd.isna(_ge_v) else "N/A",
+                              help="(Face − PV)/Face × 100. Positive = concessional; negative = expensive.")
+                with col_d4:
+                    _tf_v = _row.get("total_face_gdp", np.nan)
+                    _share = (_df_v / _tf_v * 100) if (not pd.isna(_df_v) and not pd.isna(_tf_v) and _tf_v > 0) else np.nan
+                    st.metric("Dom. Share of Total Debt",
+                              f"{_share:.1f}%" if not pd.isna(_share) else "N/A",
+                              help="Domestic as % of total public debt face value")
+
+        # ─────────────────────────────────────────────────────────────────
+        # COMBINED — Total PV of Debt
+        # ─────────────────────────────────────────────────────────────────
+        st.markdown('<div class="section-header">Combined — Total PV of Debt (Ext. PPG + Domestic)</div>', unsafe_allow_html=True)
+
+        if not pv_dec.empty and "total_pv_gdp" in pv_dec.columns:
+            pv_nonempty = pv_dec.dropna(subset=["total_pv_gdp"], how="all")
+            if not pv_nonempty.empty:
+                _fy  = pv_nonempty.index[0]
+                _fr  = pv_nonempty.loc[_fy]
+                col_t1, col_t2, col_t3, col_t4 = st.columns(4)
+                with col_t1:
+                    _epv = _fr.get("ext_pv_gdp", np.nan)
+                    st.metric("External PV (% GDP)", f"{_epv:.1f}%" if not pd.isna(_epv) else "N/A",
+                              help=f"Year {_fy}: WB pre-computed PV of external PPG debt")
+                with col_t2:
+                    _dpv = _fr.get("dom_pv_gdp", np.nan)
+                    st.metric("Domestic PV (% GDP)", f"{_dpv:.1f}%" if not pd.isna(_dpv) else "N/A",
+                              help=f"Year {_fy}: Computed from domestic face value")
+                with col_t3:
+                    _tpv = _fr.get("total_pv_gdp", np.nan)
+                    st.metric("Total PV (% GDP)", f"{_tpv:.1f}%" if not pd.isna(_tpv) else "N/A",
+                              help=f"Year {_fy}: Ext + Dom combined")
+                with col_t4:
+                    _ext_thresh = thresh["pv_gdp"]
+                    _pct = (_tpv / _ext_thresh * 100) if (not pd.isna(_tpv) and _ext_thresh > 0) else np.nan
+                    st.metric("Total PV vs Ext. Threshold",
+                              f"{_pct:.0f}%" if not pd.isna(_pct) else "N/A",
+                              help=f"Informational: Total PV/GDP as % of the LIC DSF external threshold ({_ext_thresh}%). "
+                                   "The official threshold applies to external PPG only.")
+
+                # Chart
+                _chart_df = pv_nonempty[
+                    [c for c in ["ext_pv_gdp", "dom_pv_gdp", "total_pv_gdp"] if c in pv_nonempty.columns]
+                ].copy()
+                _chart_df = _chart_df.rename(columns={
+                    "ext_pv_gdp":   "External PPG (PV, % GDP)",
+                    "dom_pv_gdp":   "Domestic (PV, % GDP)",
+                    "total_pv_gdp": "Total (PV, % GDP)",
+                })
+                _chart_long = _chart_df.reset_index().melt(id_vars="year", var_name="Component", value_name="% GDP")
+                _fig_total = px.line(
+                    _chart_long, x="year", y="% GDP", color="Component",
+                    title=f"Total PV of Public Debt — {country}",
+                    labels={"year": "Year", "% GDP": "% of GDP"},
+                    color_discrete_map={
+                        "External PPG (PV, % GDP)": "#1565C0",
+                        "Domestic (PV, % GDP)":     "#E65100",
+                        "Total (PV, % GDP)":        "#2E7D32",
+                    },
+                )
+                _fig_total.add_hline(
+                    y=thresh["pv_gdp"],
+                    line_dash="dash", line_color="red", line_width=1.5,
+                    annotation_text=f"LIC DSF Ext. Threshold ({thresh['pv_gdp']}%)",
+                    annotation_position="top left",
+                )
+                _fig_total.update_layout(
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                    hovermode="x unified",
+                )
+                st.plotly_chart(_fig_total, use_container_width=True)
+
+                with st.expander("📋 Two-Component PV Decomposition by Year", expanded=False):
+                    _tbl = pv_dec[[
+                        c for c in [
+                            "ext_face_gdp", "ext_pv_gdp", "ext_grant_element",
+                            "dom_face_gdp", "dom_pv_gdp", "dom_grant_element",
+                            "total_face_gdp", "total_pv_gdp",
+                        ] if c in pv_dec.columns
+                    ]].copy()
+                    _rename = {
+                        "ext_face_gdp":     "Ext. Face (% GDP)",
+                        "ext_pv_gdp":       "Ext. PV (% GDP)",
+                        "ext_grant_element":"Ext. Grant El. (%)",
+                        "dom_face_gdp":     "Dom. Face (% GDP)",
+                        "dom_pv_gdp":       "Dom. PV (% GDP)",
+                        "dom_grant_element":"Dom. Grant El. (%)",
+                        "total_face_gdp":   "Total Face (% GDP)",
+                        "total_pv_gdp":     "Total PV (% GDP)",
+                    }
+                    _tbl = _tbl.rename(columns=_rename)
+                    _tbl.index.name = "Year"
+                    st.dataframe(_tbl.round(1).fillna("—"), use_container_width=True)
+                    st.caption(
+                        f"**External PV source**: "
+                        f"{'WB pre-computed DT.DOD.PVLX.CD (5% discount)' if not pv_ass.get('override_ext_pv') else 'Recomputed — see sidebar'}"
+                        f" | **Domestic PV assumptions**: "
+                        f"coupon={pv_ass.get('dom_coupon_pct', 8):.1f}%, "
+                        f"maturity={float(pv_ass.get('dom_maturity_yr', 5)):.1f} yrs, "
+                        f"discount={pv_ass.get('dom_discount_pct', 5):.1f}%, "
+                        f"amortization={pv_ass.get('dom_amortization', 'level')}"
+                    )
+        else:
+            st.info("Combined PV data not available — check that data was fetched successfully.")
 
 
 # ════════════════════════════════════════════════════════════════════════════
