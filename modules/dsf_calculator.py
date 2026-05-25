@@ -220,6 +220,225 @@ def _safe_val(row, col):
         return None
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 2b.  PV of Debt — Two-Component Decomposition
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_pv_from_face_value(
+    face_pct_gdp:      float,
+    coupon_rate_pct:   float,
+    avg_maturity_yr:   float,
+    discount_rate_pct: float = 5.0,
+    amortization:      str   = "level",
+) -> float:
+    """
+    Compute the present value of a debt stock from its face value and
+    assumed loan characteristics.  Returns PV as % of GDP (same units as
+    face_pct_gdp).
+
+    Parameters
+    ----------
+    face_pct_gdp      : Nominal (face) value of debt as % of GDP.
+    coupon_rate_pct   : Average annual interest rate on the portfolio (e.g. 8.0).
+    avg_maturity_yr   : Average remaining maturity in years.
+    discount_rate_pct : Discount rate — IMF/WB standard for LIC DSF is 5%.
+    amortization      : 'level'  — equal annual principal repayments
+                                    (typical for concessional IDA/bilat loans).
+                        'bullet' — all principal at maturity + annual coupons
+                                    (typical for market-access bonds).
+
+    Formula (level amortisation)
+    ----------------------------
+    For t = 1 … T:
+      principal_t  = FaceValue / T
+      interest_t   = remaining_balance × coupon_rate
+      cash_flow_t  = principal_t + interest_t
+      PV           = Σ cash_flow_t / (1 + r)^t
+
+    Formula (bullet)
+    ----------------
+    PV = FaceValue × coupon_rate × Σ 1/(1+r)^t  (t=1…T)
+       + FaceValue / (1+r)^T
+    """
+    if pd.isna(face_pct_gdp) or face_pct_gdp <= 0 or avg_maturity_yr <= 0:
+        return np.nan
+
+    r  = discount_rate_pct / 100.0
+    c  = coupon_rate_pct   / 100.0
+    F  = float(face_pct_gdp)
+    T  = max(1, int(round(float(avg_maturity_yr))))
+
+    pv = 0.0
+
+    if amortization == "bullet":
+        # Annual coupon payments + bullet principal at maturity
+        for t in range(1, T + 1):
+            pv += (F * c) / (1.0 + r) ** t
+        pv += F / (1.0 + r) ** T
+
+    else:  # "level" — equal annual amortisation (default)
+        annual_principal = F / T
+        remaining        = F
+        for t in range(1, T + 1):
+            interest   = remaining * c
+            cash_flow  = annual_principal + interest
+            pv        += cash_flow / (1.0 + r) ** t
+            remaining -= annual_principal
+
+    return round(pv, 4)
+
+
+def grant_element(
+    face_pct_gdp:      float,
+    coupon_rate_pct:   float,
+    avg_maturity_yr:   float,
+    discount_rate_pct: float = 5.0,
+    amortization:      str   = "level",
+) -> float:
+    """
+    Grant element = (Face − PV) / Face × 100  (expressed in %).
+    A positive grant element means the loan is concessional at the given
+    discount rate.  The IMF/WB classify a loan as concessional if the
+    grant element ≥ 35% at a 5% discount rate.
+    """
+    if pd.isna(face_pct_gdp) or face_pct_gdp <= 0:
+        return np.nan
+    pv = compute_pv_from_face_value(
+        face_pct_gdp, coupon_rate_pct, avg_maturity_yr,
+        discount_rate_pct, amortization,
+    )
+    if pd.isna(pv):
+        return np.nan
+    return round((face_pct_gdp - pv) / face_pct_gdp * 100, 2)
+
+
+def compute_total_pv_series(
+    df:                pd.DataFrame,
+    base_year:         int,
+    n_years:           int   = 10,
+    # ── Domestic debt assumptions ──────────────────────────────────────────
+    dom_coupon_pct:    float = 8.0,
+    dom_maturity_yr:   float = 5.0,
+    dom_discount_pct:  float = 5.0,
+    dom_amortization:  str   = "level",
+    # ── External debt assumptions (only used when override_ext_pv=True) ───
+    override_ext_pv:   bool  = False,
+    ext_coupon_pct:    float = 2.0,
+    ext_maturity_yr:   float = 15.0,
+    ext_discount_pct:  float = 5.0,
+    ext_amortization:  str   = "level",
+) -> pd.DataFrame:
+    """
+    Compute the two-component PV-of-debt breakdown over the projection
+    horizon and sum into a total.
+
+    Component 1 — External PPG debt
+      Default: use the World Bank pre-computed series (DT.DOD.PVLX.CD)
+               already in df["pv_debt_gdp"], which embeds the standard 5%
+               discount rate.
+      Override: recompute from face value df["ppg_debt_usd"] using
+               ext_coupon_pct / ext_maturity_yr / ext_discount_pct.
+
+    Component 2 — Domestic public debt
+      Face value = Total Public Debt (WEO GGXWDG_NGDP) − External PPG (% GDP).
+      PV computed from face value using dom_coupon_pct / dom_maturity_yr /
+      dom_discount_pct.
+
+    Returns DataFrame indexed by year with columns:
+      ext_face_gdp        external PPG debt face value (% GDP)
+      ext_pv_gdp          external PPG debt PV (% GDP)
+      ext_grant_element   grant element on external debt (%)
+      dom_face_gdp        domestic debt face value (% GDP)
+      dom_pv_gdp          domestic debt PV (% GDP)
+      dom_grant_element   grant element on domestic debt (%)
+      total_face_gdp      ext_face + dom_face (% GDP)
+      total_pv_gdp        ext_pv  + dom_pv   (% GDP)
+    """
+    years = list(range(base_year + 1, base_year + n_years + 1))
+    out   = pd.DataFrame(index=years, dtype=float)
+    out.index.name = "year"
+
+    for yr in years:
+        if yr not in df.index:
+            continue
+        row = df.loc[yr]
+
+        # ── GDP in USD millions ───────────────────────────────────────────
+        gdp_mn = _safe_val(row, "gdp_usd_mn")
+        if gdp_mn is None:
+            gdp_wb = _safe_val(row, "gdp_usd_wb")
+            if gdp_wb:
+                gdp_mn = gdp_wb / 1e6
+
+        # ── External PPG: face value % GDP ───────────────────────────────
+        ppg_usd = _safe_val(row, "ppg_debt_usd")   # World Bank DT.DOD.DPPG.CD (current USD)
+        ext_face = None
+        if ppg_usd is not None and gdp_mn is not None and gdp_mn > 0:
+            ext_face = (ppg_usd / 1e6) / gdp_mn * 100  # USD → USD mn → % GDP
+
+        out.loc[yr, "ext_face_gdp"] = ext_face
+
+        # ── External PPG: present value % GDP ────────────────────────────
+        if override_ext_pv and ext_face is not None:
+            ext_pv = compute_pv_from_face_value(
+                ext_face, ext_coupon_pct, ext_maturity_yr,
+                ext_discount_pct, ext_amortization,
+            )
+            out.loc[yr, "ext_pv_gdp"] = ext_pv
+            out.loc[yr, "ext_grant_element"] = grant_element(
+                ext_face, ext_coupon_pct, ext_maturity_yr,
+                ext_discount_pct, ext_amortization,
+            )
+        else:
+            # Use World Bank pre-computed PV (standard approach)
+            ext_pv = _safe_val(row, "pv_debt_gdp")
+            out.loc[yr, "ext_pv_gdp"] = ext_pv
+            # Implied grant element from WB PV vs face value
+            if ext_pv is not None and ext_face is not None and ext_face > 0:
+                out.loc[yr, "ext_grant_element"] = (ext_face - ext_pv) / ext_face * 100
+
+        # ── Total public debt % GDP (WEO GGXWDG_NGDP) ────────────────────
+        total_pub = _safe_val(row, "pub_debt_gdp")
+
+        # ── Domestic debt face value = Total − External PPG ───────────────
+        dom_face = None
+        if total_pub is not None and ext_face is not None:
+            dom_face = max(float(total_pub) - float(ext_face), 0.0)
+        elif total_pub is not None:
+            # Fallback: no external breakdown → flag as missing
+            dom_face = None
+
+        out.loc[yr, "dom_face_gdp"] = dom_face
+
+        # ── Domestic debt: PV ─────────────────────────────────────────────
+        if dom_face is not None and dom_face > 0:
+            dom_pv = compute_pv_from_face_value(
+                dom_face, dom_coupon_pct, dom_maturity_yr,
+                dom_discount_pct, dom_amortization,
+            )
+            out.loc[yr, "dom_pv_gdp"] = dom_pv
+            out.loc[yr, "dom_grant_element"] = grant_element(
+                dom_face, dom_coupon_pct, dom_maturity_yr,
+                dom_discount_pct, dom_amortization,
+            )
+        else:
+            out.loc[yr, "dom_pv_gdp"]        = 0.0
+            out.loc[yr, "dom_grant_element"]  = np.nan
+
+        # ── Combined totals ───────────────────────────────────────────────
+        ext_f_v = out.loc[yr, "ext_face_gdp"]  if not pd.isna(out.loc[yr, "ext_face_gdp"])  else 0.0
+        dom_f_v = out.loc[yr, "dom_face_gdp"]  if not pd.isna(out.loc[yr, "dom_face_gdp"])  else 0.0
+        ext_p_v = out.loc[yr, "ext_pv_gdp"]    if not pd.isna(out.loc[yr, "ext_pv_gdp"])    else 0.0
+        dom_p_v = out.loc[yr, "dom_pv_gdp"]    if not pd.isna(out.loc[yr, "dom_pv_gdp"])    else 0.0
+
+        if ext_f_v > 0 or dom_f_v > 0:
+            out.loc[yr, "total_face_gdp"] = ext_f_v + dom_f_v
+        if ext_p_v > 0 or dom_p_v > 0:
+            out.loc[yr, "total_pv_gdp"]   = ext_p_v + dom_p_v
+
+    return out
+
+
 def compute_public_indicator(df: pd.DataFrame, base_year: int, n_years: int = 10) -> pd.Series:
     """
     Compute total public debt (% GDP) over projection horizon.
@@ -549,16 +768,27 @@ def run_full_dsa(
     ci_result:       CIResult,
     base_year:       int,
     world_growth:    pd.Series,
-    in_distress:     bool = False,
+    in_distress:     bool  = False,
     contingent_pct:  float = 5.0,
+    # ── PV decomposition assumptions ─────────────────────────────────────────
+    dom_coupon_pct:   float = 8.0,
+    dom_maturity_yr:  float = 5.0,
+    dom_discount_pct: float = 5.0,
+    dom_amortization: str   = "level",
+    override_ext_pv:  bool  = False,
+    ext_coupon_pct:   float = 2.0,
+    ext_maturity_yr:  float = 15.0,
+    ext_discount_pct: float = 5.0,
+    ext_amortization: str   = "level",
 ) -> dict:
     """
     Run the complete LIC DSA:
       1. Compute baseline external indicators
       2. Compute baseline public debt indicator
-      3. Check thresholds
-      4. Run stress tests
-      5. Determine risk rating
+      3. Compute two-component PV decomposition (external + domestic)
+      4. Check thresholds
+      5. Run stress tests
+      6. Determine risk rating
     Returns a dict with all results.
     """
     classification = ci_result.classification
@@ -568,6 +798,20 @@ def run_full_dsa(
 
     # Baseline public debt
     pub_debt_series = compute_public_indicator(df, base_year, n_years=10)
+
+    # Two-component PV decomposition (external + domestic)
+    pv_decomp = compute_total_pv_series(
+        df, base_year, n_years=10,
+        dom_coupon_pct   = dom_coupon_pct,
+        dom_maturity_yr  = dom_maturity_yr,
+        dom_discount_pct = dom_discount_pct,
+        dom_amortization = dom_amortization,
+        override_ext_pv  = override_ext_pv,
+        ext_coupon_pct   = ext_coupon_pct,
+        ext_maturity_yr  = ext_maturity_yr,
+        ext_discount_pct = ext_discount_pct,
+        ext_amortization = ext_amortization,
+    )
 
     # Threshold checks
     baseline_thresholds = check_thresholds(ext_indicators, classification, "Baseline")
@@ -592,8 +836,20 @@ def run_full_dsa(
         "pub_benchmark":       PUBLIC_BENCHMARKS[classification],
         "ext_indicators":      ext_indicators,
         "pub_debt_series":     pub_debt_series,
+        "pv_decomp":           pv_decomp,           # NEW: two-component PV breakdown
         "baseline_thresholds": baseline_thresholds,
         "pub_threshold":       pub_threshold,
         "stress_tests":        stress_results,
         "rating":              rating,
+        # Store PV assumptions for display
+        "pv_assumptions": {
+            "dom_coupon_pct":   dom_coupon_pct,
+            "dom_maturity_yr":  dom_maturity_yr,
+            "dom_discount_pct": dom_discount_pct,
+            "dom_amortization": dom_amortization,
+            "override_ext_pv":  override_ext_pv,
+            "ext_coupon_pct":   ext_coupon_pct if override_ext_pv else 5.0,
+            "ext_maturity_yr":  ext_maturity_yr if override_ext_pv else "(WB pre-computed)",
+            "ext_discount_pct": ext_discount_pct,
+        },
     }
